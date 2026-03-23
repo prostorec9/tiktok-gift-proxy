@@ -10,22 +10,23 @@ const wss = new WebSocketServer({ server });
 const tiktokConnections = new Map();
 
 const SELF_URL = process.env.SERVER_URL || 'https://tiktok-gift-proxy.onrender.com';
-
-// Кеш: giftId -> реальный URL картинки
 const giftUrlCache = new Map();
+let lastGiftDebug = null; // Сохраняем последний подарок для диагностики
 
-// Не засыпаем
 setInterval(() => {
     https.get(SELF_URL + '/ping', () => {}).on('error', () => {});
 }, 10 * 60 * 1000);
 
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.json({ status: 'running', version: '6.0' }));
+app.get('/', (req, res) => res.json({ status: 'running', version: '7.0' }));
 
-// Простое проксирование картинки по URL
+// Диагностика — показывает структуру последнего подарка
+app.get('/debug', (req, res) => {
+    res.json({ lastGift: lastGiftDebug });
+});
+
 function proxyUrl(imageUrl, res) {
     if (!imageUrl) return res.status(404).send('No URL');
-
     const options = {
         headers: {
             'Referer': 'https://www.tiktok.com/',
@@ -33,75 +34,39 @@ function proxyUrl(imageUrl, res) {
             'Accept': 'image/webp,image/apng,image/*,*/*',
         }
     };
-
     const getter = imageUrl.startsWith('https://') ? https : http;
-
     getter.get(imageUrl, options, (upstream) => {
         if (upstream.statusCode === 301 || upstream.statusCode === 302) {
             return proxyUrl(upstream.headers.location, res);
         }
         if (upstream.statusCode !== 200) {
             upstream.resume();
-            return res.status(upstream.statusCode).send('Not found');
+            return res.status(upstream.statusCode).send('Not found: ' + upstream.statusCode);
         }
         res.setHeader('Content-Type', upstream.headers['content-type'] || 'image/png');
         res.setHeader('Cache-Control', 'public, max-age=86400');
         res.setHeader('Access-Control-Allow-Origin', '*');
         upstream.pipe(res);
     }).on('error', (e) => {
-        console.error('Proxy error:', e.message);
-        if (!res.headersSent) res.status(500).send('Proxy error');
+        if (!res.headersSent) res.status(500).send('Error: ' + e.message);
     });
 }
 
-// Картинка подарка
 app.get('/gift-image/:giftId', (req, res) => {
     const giftId = req.params.giftId;
-
     if (giftUrlCache.has(giftId)) {
         return proxyUrl(giftUrlCache.get(giftId), res);
     }
-
-    // Пробуем стандартные CDN
-    const urls = [
-        `https://p16-webcast.tiktokcdn.com/img/gift_${giftId}~tplv-obj.image`,
-        `https://p19-webcast.tiktokcdn.com/img/gift_${giftId}~tplv-obj.image`,
-    ];
-
-    tryNextUrl(urls, 0, res);
+    // Пробуем CDN напрямую
+    proxyUrl(`https://p16-webcast.tiktokcdn.com/img/gift_${giftId}~tplv-obj.image`, res);
 });
 
-function tryNextUrl(urls, idx, res) {
-    if (idx >= urls.length) return res.status(404).send('Not found');
-
-    const options = {
-        headers: {
-            'Referer': 'https://www.tiktok.com/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        }
-    };
-
-    https.get(urls[idx], options, (upstream) => {
-        if (upstream.statusCode === 200) {
-            res.setHeader('Content-Type', upstream.headers['content-type'] || 'image/png');
-            res.setHeader('Cache-Control', 'public, max-age=86400');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            upstream.pipe(res);
-        } else {
-            upstream.resume();
-            tryNextUrl(urls, idx + 1, res);
-        }
-    }).on('error', () => tryNextUrl(urls, idx + 1, res));
-}
-
-// Аватарки
 app.get('/avatar', (req, res) => {
     const avatarUrl = req.query.url;
     if (!avatarUrl) return res.status(400).send('No URL');
     proxyUrl(decodeURIComponent(avatarUrl), res);
 });
 
-// WebSocket
 wss.on('connection', (clientWs, req) => {
     const url = new URL(req.url, 'http://localhost');
     const username = url.searchParams.get('username');
@@ -138,24 +103,38 @@ wss.on('connection', (clientWs, req) => {
         if (clientWs.readyState !== 1) return;
         if (data.giftType === 1 && !data.repeatEnd) return;
 
-        // Получаем реальный URL картинки из extendedGiftInfo
-        let giftImageUrl = `${SELF_URL}/gift-image/${data.giftId}`;
+        // Сохраняем для диагностики
+        lastGiftDebug = {
+            giftId: data.giftId,
+            giftName: data.giftName,
+            extendedGiftInfo: data.extendedGiftInfo,
+            giftPictureUrl: data.giftPictureUrl,
+            allKeys: Object.keys(data),
+        };
 
-        try {
-            if (data.extendedGiftInfo && data.extendedGiftInfo.image) {
-                const img = data.extendedGiftInfo.image;
-                let realUrl = null;
-                if (img.url_list && img.url_list.length > 0) realUrl = img.url_list[0];
-                else if (img.uri) realUrl = `https://p16-webcast.tiktokcdn.com/img/${img.uri}~tplv-obj.image`;
-                else if (typeof img === 'string') realUrl = img;
+        // Ищем URL картинки во всех возможных местах
+        let realImageUrl = null;
 
-                if (realUrl) {
-                    giftUrlCache.set(String(data.giftId), realUrl);
-                    giftImageUrl = `${SELF_URL}/gift-image/${data.giftId}`;
-                }
+        if (data.giftPictureUrl) {
+            realImageUrl = data.giftPictureUrl;
+        } else if (data.extendedGiftInfo) {
+            const ext = data.extendedGiftInfo;
+            if (ext.image) {
+                if (ext.image.url_list && ext.image.url_list.length > 0) realImageUrl = ext.image.url_list[0];
+                else if (ext.image.uri) realImageUrl = `https://p16-webcast.tiktokcdn.com/img/${ext.image.uri}~tplv-obj.image`;
+                else if (typeof ext.image === 'string') realImageUrl = ext.image;
             }
-        } catch(e) {}
+            if (!realImageUrl && ext.icon) {
+                if (ext.icon.url_list && ext.icon.url_list.length > 0) realImageUrl = ext.icon.url_list[0];
+            }
+        }
 
+        if (realImageUrl) {
+            giftUrlCache.set(String(data.giftId), realImageUrl);
+            console.log(`[IMG] Found real URL for gift ${data.giftId}: ${realImageUrl.substring(0, 80)}`);
+        }
+
+        const giftImageUrl = `${SELF_URL}/gift-image/${data.giftId}`;
         const avatarUrl = data.profilePictureUrl
             ? `${SELF_URL}/avatar?url=${encodeURIComponent(data.profilePictureUrl)}`
             : '';
@@ -184,4 +163,9 @@ wss.on('connection', (clientWs, req) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server v6 on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server v7 on port ${PORT}`));
+```
+
+**Commit** → подожди 2 минуты → подключись к стримеру → дождись любого подарка → зайди в браузере на:
+```
+https://tiktok-gift-proxy.onrender.com/debug
