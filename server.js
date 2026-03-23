@@ -9,22 +9,32 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const tiktokConnections = new Map();
 
-// Не даём серверу засыпать — пингуем сами себя каждые 10 минут
+// Кеш картинок подарков — загружаем один раз
+const giftImageCache = new Map();
+
+// Не даём серверу засыпать
 const SELF_URL = process.env.SERVER_URL || 'https://tiktok-gift-proxy.onrender.com';
 setInterval(() => {
     https.get(SELF_URL + '/ping', () => {}).on('error', () => {});
 }, 10 * 60 * 1000);
 
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.json({ status: 'running', version: '3.0' }));
+app.get('/', (req, res) => res.json({ status: 'running', version: '4.0' }));
 
-// Проксируем картинки подарков
-app.get('/gift-image/:giftId', (req, res) => {
-    const giftId = req.params.giftId;
+// Проксируем картинки — через кеш реальных URL из TikTok API
+app.get('/gift-image/:giftId', async (req, res) => {
+    const giftId = parseInt(req.params.giftId);
+    
+    // Если есть реальный URL в кеше — используем его
+    if (giftImageCache.has(giftId)) {
+        const imageUrl = giftImageCache.get(giftId);
+        return proxyImage(imageUrl, res);
+    }
+    
+    // Fallback — стандартные CDN URL
     const urls = [
         `https://p16-webcast.tiktokcdn.com/img/gift_${giftId}~tplv-obj.image`,
         `https://p19-webcast.tiktokcdn.com/img/gift_${giftId}~tplv-obj.image`,
-        `https://p16-webcast.tiktokcdn.com/img/maliva/webcast-va/gift_${giftId}~tplv-obj.image`,
     ];
     fetchWithFallback(urls, 0, res);
 });
@@ -33,32 +43,72 @@ app.get('/gift-image/:giftId', (req, res) => {
 app.get('/avatar', (req, res) => {
     const avatarUrl = req.query.url;
     if (!avatarUrl) { res.status(400).send('No URL'); return; }
-    try {
-        https.get(decodeURIComponent(avatarUrl), {
-            headers: { 'Referer': 'https://www.tiktok.com/', 'User-Agent': 'Mozilla/5.0' }
-        }, (r) => {
-            res.setHeader('Content-Type', r.headers['content-type'] || 'image/jpeg');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            r.pipe(res);
-        }).on('error', () => res.status(500).send('Failed'));
-    } catch(e) { res.status(400).send('Invalid URL'); }
+    proxyImage(decodeURIComponent(avatarUrl), res);
 });
+
+function proxyImage(url, res) {
+    try {
+        const options = {
+            headers: {
+                'Referer': 'https://www.tiktok.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            }
+        };
+        const protocol = url.startsWith('https') ? https : http;
+        protocol.get(url, options, (r) => {
+            if (r.statusCode === 301 || r.statusCode === 302) {
+                return proxyImage(r.headers.location, res);
+            }
+            if (r.statusCode === 200) {
+                res.setHeader('Content-Type', r.headers['content-type'] || 'image/png');
+                res.setHeader('Cache-Control', 'public, max-age=86400');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                r.pipe(res);
+            } else {
+                res.status(r.statusCode).send('Image not available');
+            }
+        }).on('error', () => res.status(500).send('Proxy error'));
+    } catch(e) {
+        res.status(400).send('Invalid URL');
+    }
+}
 
 function fetchWithFallback(urls, index, res) {
     if (index >= urls.length) { res.status(404).send('Not found'); return; }
-    https.get(urls[index], {
-        headers: { 'Referer': 'https://www.tiktok.com/', 'User-Agent': 'Mozilla/5.0' }
-    }, (r) => {
-        if (r.statusCode === 200) {
-            res.setHeader('Content-Type', r.headers['content-type'] || 'image/png');
-            res.setHeader('Cache-Control', 'public, max-age=86400');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            r.pipe(res);
-        } else {
-            fetchWithFallback(urls, index + 1, res);
-        }
-    }).on('error', () => fetchWithFallback(urls, index + 1, res));
+    proxyImage(urls[index], {
+        setHeader: res.setHeader.bind(res),
+        status: res.status.bind(res),
+        send: res.send.bind(res),
+        pipe: (stream) => stream.pipe(res),
+    });
 }
+
+// Загружаем список всех подарков и кешируем картинки
+async function preloadGiftImages() {
+    try {
+        console.log('[*] Загружаем список подарков TikTok...');
+        const tempConn = new WebcastPushConnection('_', {
+            enableExtendedGiftInfo: true,
+        });
+        const gifts = await tempConn.getAvailableGifts();
+        if (gifts && gifts.length > 0) {
+            gifts.forEach(gift => {
+                if (gift.id && gift.image && gift.image.url_list && gift.image.url_list.length > 0) {
+                    giftImageCache.set(gift.id, gift.image.url_list[0]);
+                }
+            });
+            console.log(`[✓] Загружено ${giftImageCache.size} картинок подарков`);
+        }
+    } catch(e) {
+        console.log('[!] Не удалось загрузить список подарков:', e.message);
+    }
+}
+
+// Запускаем загрузку при старте
+preloadGiftImages();
+// Обновляем каждые 6 часов
+setInterval(preloadGiftImages, 6 * 60 * 60 * 1000);
 
 // WebSocket
 wss.on('connection', (clientWs, req) => {
@@ -77,7 +127,6 @@ wss.on('connection', (clientWs, req) => {
         enableExtendedGiftInfo: true,
         enableWebsocketUpgrade: true,
         requestPollingIntervalMs: 2000,
-        sessionId: '',
     });
 
     tiktokConnections.set(clientWs, tiktok);
@@ -86,32 +135,36 @@ wss.on('connection', (clientWs, req) => {
         .then(state => {
             console.log(`[✓] Connected @${username} roomId=${state.roomId}`);
             if (clientWs.readyState === 1) {
-                clientWs.send(JSON.stringify({
-                    type: 'connected',
-                    username,
-                    roomId: state.roomId
-                }));
+                clientWs.send(JSON.stringify({ type: 'connected', username, roomId: state.roomId }));
             }
         })
         .catch(err => {
             console.error(`[✗] @${username}: ${err.message}`);
             if (clientWs.readyState === 1) {
-                clientWs.send(JSON.stringify({
-                    type: 'error',
-                    message: `@${username} не в эфире или недоступен`
-                }));
+                clientWs.send(JSON.stringify({ type: 'error', message: `@${username} не в эфире` }));
             }
         });
 
     tiktok.on('gift', data => {
         if (clientWs.readyState !== 1) return;
-        // Показываем только финальные подарки (не промежуточные стрики)
         if (data.giftType === 1 && !data.repeatEnd) return;
 
-        const base = SELF_URL;
-        const giftImageUrl = `${base}/gift-image/${data.giftId}`;
+        // Берём реальный URL картинки из данных подарка или из кеша
+        let giftImageUrl = '';
+        if (data.extendedGiftInfo && data.extendedGiftInfo.image && 
+            data.extendedGiftInfo.image.url_list && data.extendedGiftInfo.image.url_list.length > 0) {
+            // Реальный URL прямо из события!
+            const realUrl = data.extendedGiftInfo.image.url_list[0];
+            giftImageUrl = `${SELF_URL}/avatar?url=${encodeURIComponent(realUrl)}`;
+        } else if (giftImageCache.has(data.giftId)) {
+            const realUrl = giftImageCache.get(data.giftId);
+            giftImageUrl = `${SELF_URL}/avatar?url=${encodeURIComponent(realUrl)}`;
+        } else {
+            giftImageUrl = `${SELF_URL}/gift-image/${data.giftId}`;
+        }
+
         const avatarUrl = data.profilePictureUrl
-            ? `${base}/avatar?url=${encodeURIComponent(data.profilePictureUrl)}`
+            ? `${SELF_URL}/avatar?url=${encodeURIComponent(data.profilePictureUrl)}`
             : '';
 
         const msg = {
@@ -124,13 +177,11 @@ wss.on('connection', (clientWs, req) => {
             giftImageUrl,
             giftCount: data.repeatCount || 1,
         };
-        console.log(`[🎁] ${msg.nickname} → ${msg.giftName} x${msg.giftCount}`);
+        console.log(`[🎁] ${msg.nickname} → ${msg.giftName} x${msg.giftCount} | img: ${giftImageUrl.substring(0, 60)}`);
         clientWs.send(JSON.stringify(msg));
     });
 
-    tiktok.on('error', err => {
-        console.error(`[!] TikTok error: ${err.message}`);
-    });
+    tiktok.on('error', err => console.error(`[!] ${err.message}`));
 
     clientWs.on('close', () => {
         const conn = tiktokConnections.get(clientWs);
@@ -139,4 +190,4 @@ wss.on('connection', (clientWs, req) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server v3 on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server v4 on port ${PORT}`));
