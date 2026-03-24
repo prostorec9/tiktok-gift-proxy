@@ -18,7 +18,7 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.json({ status: 'running', version: '7.0' }));
+app.get('/', (req, res) => res.json({ status: 'running', version: '8.0' }));
 
 // Диагностика — показывает структуру последнего подарка
 app.get('/debug', (req, res) => {
